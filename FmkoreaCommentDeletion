@@ -1,0 +1,415 @@
+// ==UserScript==
+// @name         FMKorea 댓글 일괄 삭제
+// @namespace    http://tampermonkey.net/
+// @version      1.2
+// @description  FMKorea 내 댓글을 자동으로 일괄 삭제합니다 (캡챠 자동 대기, 뒤로가기 방식)
+// @author       You
+// @match        https://www.fmkorea.com/*
+// @match        https://m.fmkorea.com/*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // 설정값
+    const DELAY_BETWEEN_ACTIONS = 2000; // 각 작업 사이 딜레이 (밀리초)
+    const CAPTCHA_CHECK_INTERVAL = 1000; // 캡챠 체크 간격 (밀리초)
+    const MY_COMMENTS_URL = 'https://www.fmkorea.com/index.php?act=dispMy_commentViewMyComment';
+    const MAX_COMMENTS_PER_PAGE = 30; // 페이지당 최대 댓글 개수
+    const RECHECK_COUNT = 2; // 재확인 횟수
+
+    // 현재 페이지 URL 확인
+    const currentUrl = window.location.href;
+
+    // 상태 저장
+    function setDeletionActive(active) {
+        if (active) {
+            sessionStorage.setItem('fmkorea_comment_deletion_active', 'true');
+        } else {
+            sessionStorage.removeItem('fmkorea_comment_deletion_active');
+        }
+    }
+
+    function isDeletionActive() {
+        return sessionStorage.getItem('fmkorea_comment_deletion_active') === 'true';
+    }
+
+    function setNoValidCommentCount(count) {
+        sessionStorage.setItem('fmkorea_no_valid_comment_count', count.toString());
+    }
+
+    function getNoValidCommentCount() {
+        const count = sessionStorage.getItem('fmkorea_no_valid_comment_count');
+        return count ? parseInt(count) : 0;
+    }
+
+    function resetNoValidCommentCount() {
+        sessionStorage.removeItem('fmkorea_no_valid_comment_count');
+    }
+
+    function setCommentToDelete(commentSrl) {
+        sessionStorage.setItem('fmkorea_comment_to_delete', commentSrl);
+    }
+
+    function getCommentToDelete() {
+        return sessionStorage.getItem('fmkorea_comment_to_delete');
+    }
+
+    function clearCommentToDelete() {
+        sessionStorage.removeItem('fmkorea_comment_to_delete');
+    }
+
+    function setCurrentCommentPage(page) {
+        sessionStorage.setItem('fmkorea_current_comment_page', page.toString());
+    }
+
+    function getCurrentCommentPage() {
+        const page = sessionStorage.getItem('fmkorea_current_comment_page');
+        return page ? parseInt(page) : 1;
+    }
+
+    function clearCurrentCommentPage() {
+        sessionStorage.removeItem('fmkorea_current_comment_page');
+    }
+
+    function getCurrentPage() {
+        const urlParams = new URLSearchParams(window.location.search);
+        return parseInt(urlParams.get('page')) || 1;
+    }
+
+    // 캡챠 페이지 감지
+    function isCaptchaPage() {
+        const captchaText = document.querySelector('h3');
+        if (captchaText && captchaText.textContent.includes('캡챠 과정을 실행해주세요')) {
+            return true;
+        }
+
+        const captchaDialog = document.querySelector('.google_recaptcha-dialog');
+        if (captchaDialog && captchaDialog.style.display !== 'none') {
+            return true;
+        }
+
+        return false;
+    }
+
+    // 캡챠 대기
+    function waitForCaptcha() {
+        console.log('캡챠 감지됨. 자동 인증 대기 중...');
+        updateCaptchaStatus(true);
+
+        const checkInterval = setInterval(() => {
+            if (!isCaptchaPage()) {
+                console.log('캡챠 완료! 내 댓글 페이지로 복귀...');
+                clearInterval(checkInterval);
+                updateCaptchaStatus(false);
+
+                // 작업 중이던 페이지 번호
+                const commentPage = getCurrentCommentPage();
+
+                setTimeout(() => {
+                    console.log(`내 댓글 ${commentPage}페이지로 직접 이동`);
+                    // 뒤로가기 하지 말고 바로 내 댓글 페이지로 이동
+                    window.location.href = MY_COMMENTS_URL + (commentPage > 1 ? '&page=' + commentPage : '');
+                }, 1000);
+            }
+        }, CAPTCHA_CHECK_INTERVAL);
+    }
+
+    // 캡챠 상태 업데이트
+    function updateCaptchaStatus(isCaptcha) {
+        const statusElement = document.querySelector('#comment-delete-status');
+        if (statusElement) {
+            const originalHTML = statusElement.innerHTML;
+            if (isCaptcha) {
+                statusElement.innerHTML = `
+                    <div style="color: orange; font-weight: bold; margin-bottom: 8px;">
+                        ⏳ 캡챠 인증 대기 중...
+                    </div>
+                ` + originalHTML;
+            }
+        }
+    }
+
+    // 브라우저 confirm 자동 승인
+    function setupAutoConfirm() {
+        const originalConfirm = window.confirm;
+        window.confirm = function(message) {
+            if (isDeletionActive() && message.includes('삭제')) {
+                console.log('자동으로 삭제 확인');
+                return true;
+            }
+            return originalConfirm(message);
+        };
+    }
+
+    // 1. 캡챠 페이지 체크
+    if (isDeletionActive() && isCaptchaPage()) {
+        waitForCaptcha();
+        return;
+    }
+
+    // 2. 내 댓글 페이지
+    if (currentUrl.includes('act=dispMy_commentViewMyComment')) {
+        // 현재 페이지 번호 저장 (캡챠 발생 시 복귀용)
+        const currentPage = getCurrentPage();
+        setCurrentCommentPage(currentPage);
+
+        addControlPanel();
+        clearCommentToDelete();
+        setupAutoConfirm();
+
+        if (isDeletionActive()) {
+            setTimeout(() => {
+                deleteNextValidComment();
+            }, DELAY_BETWEEN_ACTIONS);
+        }
+    }
+
+    // 3. 개별 글 페이지 (댓글 삭제)
+    else if (isDeletionActive()) {
+        setupAutoConfirm();
+
+        const commentToDelete = getCommentToDelete();
+        if (commentToDelete && currentUrl.includes('comment_' + commentToDelete)) {
+            setTimeout(() => {
+                clickCommentDeleteButton(commentToDelete);
+            }, DELAY_BETWEEN_ACTIONS);
+        }
+        // 캡챠 후 게시판 메인 페이지에 있는 경우 - 내 댓글 페이지로 복귀
+        else if (!currentUrl.includes('act=dispMy_commentViewMyComment') &&
+                 !currentUrl.includes('comment_')) {
+            console.log('게시판 페이지 감지. 내 댓글 페이지로 복귀...');
+            const commentPage = getCurrentCommentPage();
+            setTimeout(() => {
+                window.location.href = MY_COMMENTS_URL + (commentPage > 1 ? '&page=' + commentPage : '');
+            }, 1000);
+        }
+    }
+
+    // 컨트롤 패널 추가
+    function addControlPanel() {
+        const panel = document.createElement('div');
+        panel.id = 'comment-delete-control-panel';
+        panel.style.cssText = `
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: white;
+            border: 2px solid #333;
+            padding: 15px;
+            border-radius: 8px;
+            z-index: 10000;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            min-width: 240px;
+        `;
+
+        const title = document.createElement('h3');
+        title.textContent = '댓글 일괄 삭제';
+        title.style.margin = '0 0 10px 0';
+
+        const status = document.createElement('div');
+        status.id = 'comment-delete-status';
+        status.style.marginBottom = '10px';
+        updateStatus(status);
+
+        const startBtn = document.createElement('button');
+        startBtn.textContent = '삭제 시작';
+        startBtn.style.cssText = `
+            padding: 8px 15px;
+            margin-right: 5px;
+            background: #dc3545;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        `;
+        startBtn.onclick = startDeletion;
+
+        const stopBtn = document.createElement('button');
+        stopBtn.textContent = '중지';
+        stopBtn.style.cssText = `
+            padding: 8px 15px;
+            background: #6c757d;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        `;
+        stopBtn.onclick = stopDeletion;
+
+        panel.appendChild(title);
+        panel.appendChild(status);
+        panel.appendChild(startBtn);
+        panel.appendChild(stopBtn);
+        document.body.appendChild(panel);
+    }
+
+    function updateStatus(statusElement) {
+        const tbody = document.querySelector('tbody');
+        const rows = tbody ? tbody.querySelectorAll('tr') : [];
+        const totalCount = rows.length;
+
+        // 삭제된 댓글 개수 세기
+        let deletedCount = 0;
+        rows.forEach(row => {
+            const commentLink = row.querySelector('td.w100 div.word_style a');
+            if (commentLink && commentLink.textContent.trim().includes('[삭제된 댓글입니다.]')) {
+                deletedCount++;
+            }
+        });
+
+        const validCount = totalCount - deletedCount;
+        const isActive = isDeletionActive();
+        const currentPage = getCurrentPage();
+        const noValidCount = getNoValidCommentCount();
+
+        statusElement.innerHTML = `
+            <div>현재 페이지: <strong>${currentPage}</strong></div>
+            <div>총 댓글 수: <strong>${totalCount}</strong>개</div>
+            <div>유효한 댓글: <strong>${validCount}</strong>개</div>
+            <div>삭제된 댓글: <strong>${deletedCount}</strong>개</div>
+            ${noValidCount > 0 ? `<div style="color: orange;">재확인 횟수: <strong>${noValidCount}/${RECHECK_COUNT}</strong></div>` : ''}
+            <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #ddd;">
+                상태: <strong style="color: ${isActive ? 'green' : 'red'}">${isActive ? '진행 중' : '중지됨'}</strong>
+            </div>
+            <div style="font-size: 11px; color: #666; margin-top: 5px;">
+                💡 뒤로가기 방식으로 빠르게 삭제
+            </div>
+        `;
+    }
+
+    function startDeletion() {
+        if (confirm('댓글 삭제를 시작하시겠습니까?\n\n✅ 캡챠가 나타나면 자동으로 대기합니다.\n✅ 삭제 확인창은 자동으로 승인됩니다.\n✅ 현재 페이지가 다 삭제되면 다음 페이지로 이동합니다.\n✅ 뒤로가기 방식으로 빠르게 진행됩니다.')) {
+            setDeletionActive(true);
+            resetNoValidCommentCount();
+            location.reload();
+        }
+    }
+
+    function stopDeletion() {
+        setDeletionActive(false);
+        resetNoValidCommentCount();
+        clearCommentToDelete();
+        clearCurrentCommentPage();
+        alert('삭제가 중지되었습니다.');
+        location.reload();
+    }
+
+    // 다음 페이지로 이동
+    function goToNextPage() {
+        const currentPage = getCurrentPage();
+        const pageNavi = document.querySelector('.page-navi');
+
+        if (!pageNavi) {
+            console.log('페이지 네비게이션을 찾을 수 없습니다.');
+            alert('모든 댓글이 삭제되었습니다!');
+            setDeletionActive(false);
+            resetNoValidCommentCount();
+            return;
+        }
+
+        // 다음 페이지 링크 찾기
+        const nextPageLink = pageNavi.querySelector(`a[href*="page=${currentPage + 1}"]`);
+
+        if (nextPageLink) {
+            console.log(`${currentPage}페이지 완료! ${currentPage + 1}페이지로 이동...`);
+            resetNoValidCommentCount();
+            window.location.href = nextPageLink.getAttribute('href');
+        } else {
+            console.log('다음 페이지가 없습니다. 모든 댓글 삭제 완료!');
+            alert('모든 댓글이 삭제되었습니다!');
+            setDeletionActive(false);
+            resetNoValidCommentCount();
+        }
+    }
+
+    // 다음 유효한 댓글 찾아서 삭제 (항상 첫 번째부터)
+    function deleteNextValidComment() {
+        const tbody = document.querySelector('tbody');
+        if (!tbody) {
+            alert('댓글 목록을 찾을 수 없습니다.');
+            setDeletionActive(false);
+            return;
+        }
+
+        const rows = tbody.querySelectorAll('tr');
+
+        // 첫 번째부터 검색
+        for (let i = 0; i < rows.length; i++) {
+            const row = rows[i];
+            const commentLink = row.querySelector('td.w100 div.word_style a');
+
+            // [삭제된 댓글입니다.]가 아닌 유효한 댓글 찾기
+            if (commentLink && !commentLink.textContent.trim().includes('[삭제된 댓글입니다.]')) {
+                console.log(`${i + 1}번째 댓글 삭제 시도`);
+
+                const commentUrl = commentLink.getAttribute('href');
+                const commentMatch = commentUrl.match(/comment_(\d+)/);
+
+                if (commentMatch) {
+                    const commentSrl = commentMatch[1];
+                    setCommentToDelete(commentSrl);
+                    resetNoValidCommentCount(); // 유효한 댓글 찾았으면 카운트 리셋
+                    window.location.href = 'https://www.fmkorea.com' + commentUrl;
+                    return;
+                }
+            }
+        }
+
+        // 모든 댓글을 체크했는데 유효한 댓글이 없으면
+        console.log('유효한 댓글을 찾지 못했습니다.');
+
+        const noValidCount = getNoValidCommentCount();
+
+        if (noValidCount < RECHECK_COUNT - 1) {
+            // 재확인
+            console.log(`재확인 ${noValidCount + 1}/${RECHECK_COUNT}...`);
+            setNoValidCommentCount(noValidCount + 1);
+            setTimeout(() => {
+                location.reload();
+            }, 2000);
+        } else {
+            // 재확인도 끝났으면 다음 페이지로
+            console.log('현재 페이지의 모든 댓글이 삭제되었습니다. 다음 페이지로 이동...');
+            goToNextPage();
+        }
+    }
+
+    // 댓글 삭제 버튼 클릭
+    function clickCommentDeleteButton(commentSrl) {
+        const commentElement = document.getElementById('comment_' + commentSrl);
+
+        if (!commentElement) {
+            console.log('댓글을 찾을 수 없습니다. 뒤로가기...');
+            clearCommentToDelete();
+            setTimeout(() => {
+                history.back();
+            }, 1000);
+            return;
+        }
+
+        // 삭제 버튼 찾기
+        const deleteLink = commentElement.querySelector('a[onclick*="deleteComment"]');
+
+        if (!deleteLink) {
+            console.log('삭제 버튼을 찾을 수 없습니다. 뒤로가기...');
+            clearCommentToDelete();
+            setTimeout(() => {
+                history.back();
+            }, 1000);
+            return;
+        }
+
+        console.log('댓글 삭제 버튼 클릭');
+
+        // 삭제 실행 (confirm은 자동으로 승인됨)
+        deleteLink.click();
+
+        // 삭제 후 뒤로가기
+        setTimeout(() => {
+            clearCommentToDelete();
+            history.back();
+        }, 1500);
+    }
+})();
